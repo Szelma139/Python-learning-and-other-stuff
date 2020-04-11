@@ -1,0 +1,917 @@
+#!/usr/bin/env python
+#Licence: GPLv2.0
+#Copyright: Frank Rehberger
+#Author: Frank Rehberger <Frank.Rehberger@web.de>
+#Creation Date: 2010-03-24 15:11:23
+#Last Modified: 2010-03-26 17:43:23
+import sys
+
+## TODO
+##
+## * Handle/Warn in case of doubletten in shared libraries, such as
+##   ARArchive::~ARArchive in /usr/lib/libapt-inst-libc6.10-6.so.1.1
+
+try:
+  import pygtk
+  #tell pyGTK, if possible, that we want GTKv2
+  pygtk.require("2.0")
+except:
+  print "You need to install pyGTK or GTKv2 or set your PYTHONPATH correctly"
+  print "try: export PYTHONPATH=/usr/local/lib/python2.2/site-packages/"
+  sys.exit(1)
+  
+import gtk
+import gtk.glade
+import os
+import subprocess
+import sys, traceback
+
+## Relative location of glade file. Will be added to current prefix,
+## eg /usr/local/
+GLADE_FILE = "share/binscan/binscan.glade"
+
+## Return the absolute path of executable
+def ResolveAbsBinPath(binpath):
+  cwd = os.getcwd()
+  result = os.path.join(cwd, binpath)
+  result = os.path.normpath(result)
+  return result
+
+
+## Depending of location of binary path, resolve the location of
+## corresponding glade file
+## 
+## Returns a string with filename of glade.file
+def ResolveGladeFile(binpath):
+  ## Return parent directory of binary, such as /usr/local/bin
+  def ResolveAbsBinDir(binpath):
+    absbindir = ResolveAbsBinPath(binpath)
+    result = os.path.dirname(absbindir)
+    return result
+
+  ## Return the prefix, such as /usr/local 
+  def ResolveAbsBinPrefix(binpath):
+    prefix = os.path.dirname(ResolveAbsBinDir(binpath))
+    return prefix
+
+  ## prefix, such as /usr/ or /usr/local
+  prefix = ResolveAbsBinPrefix(binpath)
+  gladefile = os.path.join(prefix, GLADE_FILE)
+  return gladefile
+
+## Helper operations
+def HomeDirectory():
+   return os.path.expanduser('~')
+
+def IsFile(filename):
+  return os.path.isfile(filename)
+
+## Central structure holding the configuration, which could be stored
+## in gconf directory service in future releases
+class Config:
+   directory = HomeDirectory()
+   filterUnusedSymbols = True
+
+   def __init__(self):
+     pass
+
+
+## Insert a single row into the treestore model
+##
+def insert_row(model,parent,firstcolumn,secondcolumn):
+   myiter=model.insert_after(parent,None)
+   model.set_value(myiter,0,firstcolumn)
+   model.set_value(myiter,1,secondcolumn)
+   return myiter
+
+## Exception being raised if error occures
+class ScanError:
+   def __init__(self):
+     pass
+
+## Return True if file exists, otherwise False
+##
+def FileExists(path):
+   if os.path.exists(path):
+     return True
+   else:
+     ## For debugging purpose
+     return False
+
+def IsElfFile(target):
+  if FileExists(target):
+    child = subprocess.Popen(('readelf', '-n', target), 
+              stdout=subprocess.PIPE, 
+              stderr=subprocess.PIPE)
+    stringlist = child.stdout.readlines()
+    child.terminate()
+    retcode = child.wait()
+    return retcode == 0
+  else:
+    return False
+
+##
+class AboutDialog:
+  def __init__(self, gladefile):
+    windowname  = "aboutdialog"
+    wTree  = gtk.glade.XML (gladefile,windowname)
+    self.window = wTree.get_widget(windowname)
+    dic = {  "on_aboutdialog_destroy" : self.on_aboutdialog_destroy,
+             "on_aboutdialog_close" :  self.on_aboutdialog_destroy,
+             "on_aboutdialog_key_press_event" :  self.on_aboutdialog_destroy,
+             "on_aboutdialog_response" :  self.on_aboutdialog_destroy }
+    wTree.signal_autoconnect (dic)
+
+  ###
+  def on_aboutdialog_destroy(self, widget, event=None):
+    self.window.destroy()
+    return True
+       
+
+
+## Scan an executable and collect and sort the required symbols
+class ExecutableScan:
+   ## The tag for undefined symbols within a binary. These symbols
+   ## must be providedexported by other binaries.
+   UNDEF_TAGS = ['U', 'u'];
+
+   ## Binaries may be one of the following types:
+   EXEC = 0 # the executable, the root 
+   LIB  = 1 # real library, with corresponding file 
+   META = 2 # meta library, not real file
+   NFND = 3 # library not found
+
+   ### Public feature. Tripple list binaries (tag, binid, binpath) 
+   binaries = [] 
+   ## Constructor
+   ## 
+   ## The constructor will raise ScanError in case of errors.
+   ##
+   ## target: must be an executable binary, not a script
+   def __init__(self, target):
+     self.target = target
+     self.debugmode = False
+     try:
+       ## return a list of (typeid, binid, binpath), typeid may be one
+       ## of EXEC, LIB, META, NFND. META refers to virtual files, such
+       ## as linux-gate.so.1
+       self.binaries = self.tagged_binaries(target)
+
+       ## libid->( defined-symbol-list, undefiend-symbold-list )
+       self.binid2symbols_hash = self.symbols_of_all_binaries(self.binaries)
+
+     except:
+       if self.debugmode:
+         print "Exception in user code:"
+         print '-'*60
+         traceback.print_exc(file=sys.stdout)
+         print '-'*60
+       raise ScanError()
+
+   ### Public operation. Returns a hash map, mapping binary-id onto a
+   ### pair of undefined and defined symbols. Each one being a list of
+   ### tag-symbolid-pair.
+   ###
+   ### filteredReferenced, if set to True, non-referenced symbols will
+   ### be dropped, otherwise return lists of all symbols each library
+   ### provides.
+   def get_library_symbols(self, filterReferenced=True):
+     if filterReferenced:
+       return self.filter_referenced_symbols(self.binid2symbols_hash)
+     else:
+       return self.binid2symbols_hash
+
+
+   ### 
+   def tagged_binaries(self, target):
+     ##
+     ## Internal function
+     def tagged_triple(string):
+       split = string.split()
+       ## if the last element starts with '(' it refers to valid
+       ## library, such as "libacl.so.1 => /lib/libacl.so.1 (0x00752000)"
+       if split[-1].startswith('('):
+         ## Ok, library could be resolved
+         if len(split) == 4:
+           ## libselinux.so.1 => /lib/libselinux.so.1 (0x00636000)
+           return (self.LIB, split[0], split[2])
+         elif len(split) == 3:
+           ## linux-gate.so.1 =>  (0x00220000)
+           return (self.META, split[0], None)
+         elif len(split) == 2:
+           ## /lib/ld-linux.so.2 (0x00e45000)
+           return (self.LIB, split[0], split[0])
+         else:
+           raise ScanError()
+       else:
+         ## Library could not be found
+         ## libddsosnet.so => not found
+         return (self.NFND, split[0], None)
+
+     ## invoke the ldd command on target
+     ## > ldd target
+     child = subprocess.Popen(('ldd', target), 
+              stdout=subprocess.PIPE, 
+              stderr=subprocess.PIPE)
+     stringlist = child.stdout.readlines()
+     child.terminate()
+     retcode = child.wait()
+     
+     if retcode != 0:
+       raise ScanError()
+
+     ## prepend the executable to the list
+     liblist = [(self.EXEC, target, target)] + \
+         map(tagged_triple, stringlist)
+     return liblist
+
+   ## Return an hash map of binid to symbol lists
+   def symbols_of_all_binaries(self, binarylist):
+     result = {}
+     for (typeid,binid,binpath) in binarylist:
+       ## some libraries may be virtual, such as linux-gate.so.1
+       if typeid in [self.NFND, self.META]:
+         ## corresponding file does not exist or not found
+         ## for example linux-gate.so.1 has no correspondig library
+         result[binid] = ([],[]) ## empty set
+       else:
+         ## returns a tuple (defined-list, undefined-list), where each element
+         ## is a of tuples again
+         result[binid] = self.sorted_symbols_of_binary(binpath)
+     
+     return result
+
+   ## Read symbols from binary and create two sets, one of defined
+   ## symbols and one of undefined symbols
+   def sorted_symbols_of_binary(self, binary):
+     ##
+     
+     def sorted_symbols(self, symlist):
+       defined=[]
+       undefined=[]
+     
+       for (tag,symbol) in symlist:
+         ## Call "man nm" for usage:
+         ##   "T"
+         ##  "t" The symbol is in the text (code) section.
+         ## 
+         ##   "U" The symbol is undefined.
+         ## 
+         ##   "u" The symbol is a unique global symbol.  This is a GNU extension
+         ##      to the standard set of ELF symbol bindings.  For such a symbol
+         ##      the dynamic linker will make sure that in the entire process
+         ##      there is just one symbol with this name and type in use.
+         ## 
+         ##   "V"
+         ##   "v" The symbol is a weak object.  When a weak defined symbol is
+         ##      linked with a normal defined symbol, the normal defined symbol
+         ##      is used with no error.  When a weak undefined symbol is linked
+         ##      and the symbol is not defined, the value of the weak symbol
+         ##      becomes zero with no error.  On some systems, uppercase
+         ##      indicates that a default value has been specified.
+         ## 
+         ##   "W"
+         ##   "w" The symbol is a weak symbol that has not been specifically
+         ##      tagged as a weak object symbol.  When a weak defined symbol is
+         ##      linked with a normal defined symbol, the normal defined symbol
+         ##      is used with no error.  When a weak undefined symbol is linked
+         ##      and the symbol is not defined, the value of the symbol is
+         ##      determined in a system-specific manner without error.  On some
+         ##      systems, uppercase indicates that a default value has been
+         ##      specified.
+         ## 
+         if tag in self.UNDEF_TAGS:
+           ## use hashmap as set 
+           undefined = undefined + [(tag,symbol)]
+         elif tag not in ['A']:
+           ## ignore "absolute" symbols such as GLIBC_2.8, being used
+           ## for versioning
+           defined = defined + [(tag,symbol)]
+     
+       return (defined, undefined)
+
+     ##
+     def is_num(numstring):         
+       ## True if something just digits such as "09856", otherwise False
+       return numstring.isalnum() and not numstring.isalpha()
+
+     ##
+     def tokenizer(string):
+       def join(v):
+         delim = " "
+         return delim.join(v)
+
+         ## discard trailing space
+         return s[:-1]
+
+       split = string.split()
+       ## expects the following formats
+       ## alarm T 00096710 00000039
+       ## typeinfo for pkgDirStream V 080724c0 00000008
+       ## VTT for std::basic_ofstream<char, std::char_traits<char> > V 080724c8 00000010
+       ## vtable for pkgDirStream V 080724e0 00000020
+       ## operator delete[](void*) U         
+       pair = None
+       # print split
+       splitlen = len(split)
+       last = split[-1]
+       beforelast = split[-2]
+       if is_num(last) and is_num(beforelast):
+         ## _IO_stdin_used R 0805be24 00000004
+         pair = (split[-3], join(split[:-3]))
+       elif is_num(last):
+         ## __bss_start A 080642cc
+         pair = (split[-2], join(split[:-2]))
+       else:
+         ## strcoll U 
+         pair = (split[-1], join(split[:-1]))
+     
+       ## print "##", str(pair)
+       # print pair
+       return pair
+
+     ## -C demangle C++ symbols
+     ## -D print dynamic symbols
+     ## -P use portability mode
+     child = subprocess.Popen(('nm', '-C', '-D', '-P', binary), 
+              stdout=subprocess.PIPE, 
+              stderr=subprocess.PIPE)
+     stringlist = child.stdout.readlines()
+     child.terminate()
+     retcode = child.wait()
+     
+     if retcode != 0:
+       raise ScanError()
+
+     symlist = map(tokenizer, stringlist)
+     return sorted_symbols(self, symlist)
+
+   ## Return only the symbols being referenced by one or the other
+   ## binary. Unused symbols will be dropped from symbol lists
+   def filter_referenced_symbols(self, symbolLists):
+     ## first figure out which symbols are referenced (T), then
+     ## create new  lists containing only the referenced symbols
+     atLeastOnceUndefined={} 
+     symbolListsNew = {}   
+     keys = symbolLists.keys()
+     for binid in keys:
+       (defined, undefined) = symbolLists[binid]
+       for (tag,symbol) in undefined:
+         ## misuse hash as unique set
+         atLeastOnceUndefined[symbol] = None 
+
+     for binid in keys:
+       (defined, undefined) = symbolLists[binid]
+       definedFiltered = \
+           filter(lambda (tag,sym): sym in atLeastOnceUndefined, defined) 
+       symbolListsNew[binid] = (definedFiltered, undefined)
+     
+     return symbolListsNew
+
+
+## Main Application Window
+##
+##   
+class appgui:
+   def __init__(self, target, gladefile, optFilter=True, optTest=False):
+     """
+     In this init we are going to display the main serverinfoapplication window
+     """
+     # The central configaration which can be stored for later startups
+     # via gconf or rc-file
+     self.config = Config()
+     self.target = target
+     self.scan = None
+     self.firstVisible = True
+     
+     self.testmode = optTest
+     self.debugmode = False
+
+     self.config.filterUnusedSymbols = optFilter
+     self.succeeded = True
+     self.gladefile = gladefile ## required to create filechooser dialog
+
+     windowname="appwindow"   
+     self.wTree=gtk.glade.XML (self.gladefile,windowname)
+     self.wTreeOpen = None
+
+     #we only have one callback to register, but you could register
+     #any number, or use a special class that 
+     #automatically registers all callbacks
+     dic = { "on_appwindow_visibility_notify_event" : \
+              self.on_visibility_notify_event,
+           "on_aboutbutton_clicked" : self.on_aboutbutton_clicked,
+           "on_appwindow_key_press_event" : self.on_appwindow_key_press,
+           "on_filetogglebutton_toggled" : self.on_filetogglebutton_toggled,
+           "on_filtercheckbutton_toggled" : self.on_filtercheckbutton_toggled,
+           "on_appwindow_destroy" : (gtk.main_quit)}
+     self.wTree.signal_autoconnect (dic)
+
+     self.window = self.wTree.get_widget(windowname)
+
+     import gobject
+     self.treeview=self.wTree.get_widget("treeview1")
+     self.treemodel=gtk.TreeStore(gobject.TYPE_STRING,
+                         gobject.TYPE_STRING)
+     self.treeview.set_model(self.treemodel)
+
+     self.treeview.set_headers_visible(True)
+     renderer=gtk.CellRendererText()
+     column=gtk.TreeViewColumn("Symbol",renderer, markup=0)
+     column.set_resizable(True)
+     self.treeview.append_column(column)
+     renderer=gtk.CellRendererText()
+
+     self.fileentry=self.wTree.get_widget("fileentry")
+    
+
+     column=gtk.TreeViewColumn("Attributes",renderer, text=1)
+     column.set_resizable(True)
+     self.treeview.append_column(column)
+     self.treeview.show()
+
+     # filterUnusedSymbols: get state from config and set value for GUI
+     # this must be done at end as it triggers a checkbutton toggle event
+     # and there for all other method attributes should be in place already
+     filterUnusedSymbols = self.config.filterUnusedSymbols
+     self.filtercheckbutton = self.wTree.get_widget("filtercheckbutton")
+     self.filtercheckbutton.set_active(filterUnusedSymbols)
+
+     ## activate and close the file open dialog
+     self.filetogglebutton = self.wTree.get_widget("filetogglebutton")
+
+     return
+    
+   ### error dialog
+   def error_dialog(self, msg):
+     dialog = gtk.MessageDialog(self.window,
+                        gtk.DIALOG_DESTROY_WITH_PARENT,
+                        gtk.MESSAGE_ERROR,
+                        gtk.BUTTONS_OK,
+                        msg)
+     dialog.run()
+     dialog.destroy()
+     
+ 
+   ### clean the view and add the library list       
+   def update_binary_view(self):
+     
+
+     ### 
+     def add_entry_to_binary_view_empty(treemodel, branch):
+       (title, attr) = branch
+       piter = insert_row(treemodel, None, title, attr)
+       return piter
+
+     ###
+     def escaped(str):
+       newstr = str.replace('<', '&gt;')
+       newstr = newstr.replace('>', '&lt;')
+       newstr = newstr.replace('&', '&amp;')
+       return newstr
+
+     ### 
+     def add_entry_to_binary_view(treemodel, branch, sorted_symbols, full_sorted_symbols):
+       ##       
+       ## insert_row(model,parent,firstcolumn,secondcolumn):
+       (title, attr) = branch
+       (provided,required) = sorted_symbols
+       (full_provided, _) = full_sorted_symbols
+       lenreq  = len(required)
+       lenprov = len(provided)
+       lenfullprov = len(full_provided)
+
+       piter = insert_row(treemodel, None, title + " [+%d/%d, -%d]" % (lenprov, lenfullprov, lenreq), attr)
+       ## the symbols list may be empty for meta and not-found libraries
+       import_iter = insert_row(treemodel,
+                                piter, \
+                                "requires (%d)" % lenreq, \
+                                "")
+       export_iter = insert_row(treemodel, \
+                                piter, \
+                                "provides (%d/%d)" % (lenprov, lenfullprov), \
+                                "")
+
+       for (tag,sym) in required:
+         insert_row(treemodel, import_iter, escaped(sym), tag)
+         
+       for (tag,sym) in provided:
+         insert_row(treemodel, export_iter, escaped(sym), tag)
+     
+       return piter
+
+     ## 
+     self.treemodel.clear()
+
+     if self.scan is not None:     
+       filter_symbols = self.config.filterUnusedSymbols
+
+       library_symbol_map = self.scan.get_library_symbols(filter_symbols)
+       full_library_symbol_map = self.scan.get_library_symbols(False)
+
+       for (typeid,binid,binpath) in self.scan.binaries:
+         if typeid == self.scan.EXEC:
+           markuped= binid
+           add_entry_to_binary_view(self.treemodel, \
+              (markuped, "[executable]"), \
+              library_symbol_map[binid], full_library_symbol_map[binid] )
+         elif typeid == self.scan.META:
+           markuped='<span foreground="grey">%s</span>' % (binid)
+           add_entry_to_binary_view_empty(self.treemodel, \
+              (markuped, "[system library]"))
+         elif typeid == self.scan.NFND:
+           markuped='<span foreground="red">%s</span>' % (binid)
+           add_entry_to_binary_view_empty(self.treemodel, \
+              (markuped, "[not found]"))
+         else:
+           title = '%s ==> %s' % (binid,binpath)
+           markuped = escaped(title)
+           add_entry_to_binary_view(self.treemodel, \
+              (markuped, "[shared library]"), \
+              library_symbol_map[binid], full_library_symbol_map[binid])
+
+   ## If the dialog is not active, create a new file dialog, set the
+   ## callback handlers and set the dialog to the current target
+   ## file. Make sure that setting filename does not trigger an event.
+   def opendialog_create(self):
+     windowname = "opendialog"
+     if self.wTreeOpen is None:
+       self.wTreeOpen = gtk.glade.XML (self.gladefile,windowname)
+       dialogwidget = self.wTreeOpen.get_widget(windowname)
+       if self.target is not None:
+         dialogwidget.set_filename(self.target)
+       dic = {  "on_opendialog_destroy" : self.opendialog_close,
+                "on_opendialog_key_press_event" : self.on_appwindow_key_press,
+                "on_opendialog_update_preview" : self.on_opendialog_choose }
+
+       self.wTreeOpen.signal_autoconnect (dic)
+       dialogwidget.show() 
+     
+   ### Close the file dialog, and reset the corresponding state, the
+   ### references to glade window tree and set the state of
+   ### toggle-button to false. Doing so make sure the toggle-button
+   ### does not trigger more events on transition
+   def opendialog_close(self, widget):
+     self.wTreeOpen = None
+     widget.destroy()
+     self.filetogglebutton.set_active(False)
+
+
+   ### This operation is invoked if filename changes. It will scan the
+   ### new target file and set the corresponding object attributes. 
+   ###
+   ### Return True on success and False in case ScanError exception is
+   ### raised by scan-process. On sucess the corresponding object
+   ### attributes are initialized, such as the text-entry, etc.
+   ###
+   ### Error dialogs will be shown only if not in testmode. If in
+   ### testmode (batch mode) error dialogs will be suppressed. The
+   ### Error dialog will catch the focus.
+   ###
+   def try_scan_and_display(self, target):
+     result = True
+     try:
+       newscan = ExecutableScan(target)
+       ## scan succeeded, now set permanent
+       self.target = target
+       self.scan = newscan
+       self.fileentry.set_text(target)
+       self.update_binary_view()
+     except:
+       result = False
+       if self.debugmode:
+         print '-'*60
+         traceback.print_exc(file=sys.stdout)
+         print '-'*60
+
+       if not self.testmode:
+         self.error_dialog_scan(target)
+     
+     return result
+
+   #####CALLLBACKS
+   
+   ###
+   def on_aboutbutton_clicked(self, widget):
+     dialog = AboutDialog(self.gladefile)
+
+
+   ### Being invoked if File dialog is closed using the window-destroy
+   ### button. The Operation will set/toggle the toggle-button to
+   ### "inactive", which should trigger the destruction of the dialog
+   ### and setting the corresponding attributes. Care must be taken
+   ### that changing state of widgets does not trigger new events, for
+   ### example such as triggering another destruction-chain on
+   ### None-Objects.
+   def on_opendialog_destroy(self, widget, event, data=None):
+     print "filedialog close event"
+     self.opendialog_close(widget)
+
+   ### Being invoked if a file is selected in file dialog.
+   ###
+   def on_opendialog_choose(self, widget):
+     newtarget = widget.get_filename()
+     if newtarget is not None:
+       newtarget = newtarget.strip()
+
+     if newtarget != self.target and len(newtarget)>0 and IsFile(newtarget):
+       self.try_scan_and_display(newtarget)
+
+     return True
+
+   ### Being invoked if a file is selected in file dialog.
+   ###
+   def on_appwindow_key_press(self, widget,  event, data=None):
+     keyname = gtk.gdk.keyval_name(event.keyval)
+     control_held = event.state & gtk.gdk.CONTROL_MASK
+     if control_held and keyname=='q':
+       ## terminate the application
+       gtk.main_quit()
+     elif control_held and keyname=='o':
+       active = self.filetogglebutton.get_active()
+       if active:
+         self.filetogglebutton.set_active(False)
+       else:
+         self.filetogglebutton.set_active(True)
+         
+     return True
+
+   ### Being invoked if the file-browse toggle button changes
+   ### state. If changing from inactive-2-active, no file-dailog
+   ### should exist, and a new file-dialog should be created. If
+   ### changing from active-2-inactive, a file-dialog should exist
+   ### being destroyed now.
+   def on_filetogglebutton_toggled(self,widget):  
+     windowname = "opendialog"
+     show = widget.get_active()
+
+     if show:
+       self.opendialog_create()
+     else:
+       if self.wTreeOpen is not None:
+         dialogwidget = self.wTreeOpen.get_widget(windowname)
+         self.opendialog_close(dialogwidget)
+
+     return True
+   
+   ### Predefined error dialog in case of scan errors.
+   def error_dialog_scan(self, target):
+     self.error_dialog("Failed to scan file %s.\nMaybe you tried to scan a script." % target)   
+
+   ### Change view of treeview. Depending on new state, it will fetch
+   ### a set from Scan database and display the content in tree
+   ### view. No further file access should take place.
+   ###
+   def on_filtercheckbutton_toggled(self,widget):
+     try:
+       self.config.filterUnusedSymbols = widget.get_active()
+       self.update_binary_view()
+     except:
+       if self.debugmode:
+         print "Exception in user code:"
+         print '-'*60
+         traceback.print_exc(file=sys.stdout)
+         print '-'*60
+       
+       self.error_dialog_scan(self.target)   
+     return
+  
+   ### If first time exposed, read shared library dependencies from
+   ### executable. Only display error dialog if not in testmode (batch
+   ### mode). On sucess self.succeeded will be set to True, otherwise
+   ### False, and returned after the GtkMain loop has been left.
+   def on_visibility_notify_event(self, widget, event, data=None):
+     self.succeeded = True
+     if self.firstVisible:
+       self.firstVisible = False
+       if (self.target is not None):
+         self.succeeded = self.try_scan_and_display(self.target)
+
+     ## in testmode we want to terminate after first display
+     if self.testmode:
+       gtk.main_quit()
+
+     return False
+
+def RunNonGuiMode(targets, filter=True, verbose=False):
+  for trg in targets:
+    isElf = False
+    try:
+      isElf = FileExists(trg) and IsElfFile(trg)
+      if isElf:
+        try:
+          scan = ExecutableScan(trg)
+          binaries = scan.binaries
+          ## unfiltered symbols
+          libsymbols = scan.get_library_symbols(filter)
+          full_libsymbols =  scan.get_library_symbols(False)
+          for (tag, binid, binpath) in binaries:
+            if tag == scan.NFND:
+              print binid, "not found"
+            else:
+              (symdef, symundef) = libsymbols[binid]
+              (full_symdef, _) = full_libsymbols[binid]
+              len_full_symdefs = len(full_symdef)
+
+              if tag == scan.META:
+                print binid
+              elif tag == scan.EXEC:
+                 print binid, "[+%d/%d, -%d]" %  \
+                    (len(symdef), len_full_symdefs, len(symundef))
+              else:
+                print binid, "==>", binpath, "[+%d/%d, -%d]" %  \
+                    (len(symdef), len_full_symdefs, len(symundef))
+              if verbose:
+                for (tag, libsym) in symdef:
+                  print " +  ", libsym, tag
+                for (tag, libsym) in symundef:
+                  print " -  ", libsym, tag
+        except:
+          print "%s static-elf-file" % trg
+      else:
+        print trg, "not-elf-file"
+    except:
+      print "Scan failed for %s" % trg
+      print '-'*60
+      traceback.print_exc(file=sys.stdout)
+      print '-'*60
+  
+  return isElf
+  
+def RunAnalyzerMode(targets, silent=False, verbose=False):
+  
+  def UnexpectedExecExports(bins, libsymbols):
+    ## The first element in "bins" is the executable. Its binid is
+    ## needed to fetch the symbols from libsymbols hash-map.
+    (tag,execid,execpath) = bins[0]
+    execsyms = libsymbols[execid]
+    (exec_defs, exec_deps) = execsyms
+    ## executables are not expected to export symbols, if this value
+    ## is 1 or larger, something goes wrong in binding step of
+    ## build-phase
+        
+    ## extract only the symbols
+    return exec_defs
+
+  def UnusedLibs(bins, symbols):
+    unused_libs = []
+    for (tag, libid, libpath) in bins[1:]:
+      ## tuple of defined symbols and symbols dependencies of that
+      ## library. As we deal with filtered symbols lists, defs is
+      ## empty list in case no other binary is referencing one of its
+      ## symbols. Ignore system libraries such as linux-gate.so.1 or so,
+      ## just take into account shared libraries
+      if tag==ExecutableScan.LIB:
+        (defs,deps) =  libsymbols[libid]
+        if len(defs) == 0:
+          unused_libs += [ libid ]
+
+    return unused_libs
+
+  
+  for trg in targets:
+    isElf = False
+    try:
+      ## scan = ExecutableScan(trg)
+      ## binaries = scan.binaries
+      ## libsymbols = scan.get_library_symbols(False)
+      isElf = FileExists(trg) and IsElfFile(trg)
+      if isElf:
+        try:
+          scan = ExecutableScan(trg)
+          binaries = scan.binaries
+          ## unfiltered symbols
+          full_libsymbols = scan.get_library_symbols(False)
+          ## reduce symbol sets to referenced ones
+          libsymbols = scan.get_library_symbols(True)
+          ## executables are not expected to export symbols
+          exec_defs = UnexpectedExecExports(binaries, full_libsymbols)
+          unused_libs = UnusedLibs(binaries, libsymbols)
+          nof_exec_def = len(exec_defs)
+          nof_unused_libs = len(unused_libs)
+          ## Suppress output if silent-mode, execept there is
+          ## something weird with the binary or its dependencies
+          if not silent or nof_exec_def > 0 or nof_unused_libs > 0:
+            print "%s    exported-symbols=%d  unused-libs=%d" % \
+                (trg, len(exec_defs), len(unused_libs))
+            ## print verbose information
+            if verbose:
+              for (tag,sym) in exec_defs:
+                print "   Symbol %s" % sym, "(%s)" % tag
+              for lib in unused_libs:
+                print "   Library %s" % lib
+        except:
+          print "%s static-elf-file" % trg
+      else:
+        if not silent:
+          print trg, "not-elf-file"
+    except:
+      print "Scan failed for %s" % trg
+      print '-'*60
+      traceback.print_exc(file=sys.stdout)
+      print '-'*60
+  
+  return isElf
+
+## Print application usage on terminal
+def PrintUsage(name):
+  print "  Usage: %s <options>  [executable]" % name
+  print "         %s -d [dir]" % name
+  print "   -h    print this usage"
+  print "   -f    activate symbol filtering (default), show only"
+  print "         symbols being referenced in binary or shared libraries"
+  print "   -F    deactivate symbol filtering"
+  print "   -t    activate test mode, terminate after successful startup"
+  print "   -n    no gui mode"
+  print "   -a    analyzer mode, no gui, allows to scan a list of files in batch mode"
+  print "   -q    in case of -a, be quiet in case of non-elf files"
+  print "   -v    in case of -a, run in verbose mode"
+
+optFilter = True;
+optTest = False
+optTargets = []
+optNonGuiMode = False
+optAnalyzerMode = False
+optQuiet = False
+optVerbose = False
+
+## binary name
+binname = sys.argv[0]
+
+
+## no argument or one argument is fine, more arguments is error
+argv = sys.argv[1:]
+argvlen = len(sys.argv)
+
+for param in argv:
+  if param.startswith("-"):
+    if param == "-f":
+      optFilter = True
+    elif param == "-F":
+      optFilter = False
+    elif param == "-t":
+      optTest = True
+    elif param == "-n":
+      optNonGuiMode = True
+    elif param == "-a":
+      optAnalyzerMode = True
+    elif param == "-q":
+      optQuiet = True
+    elif param == "-v":
+      optVerbose = True
+    elif param == "-h":
+      PrintUsage(binname) 
+      exit(1)      
+    else:
+      print "Error, unexpected option '%s'" % param
+      PrintUsage(binname) 
+      exit(1)
+  else:
+    optTargets = optTargets + [ param ]
+    
+
+retcode = 0; # on success 0, otherwise 1
+
+succeeded = True
+
+
+try:
+  if optAnalyzerMode:
+    succeeded = RunAnalyzerMode(optTargets, silent=optQuiet, verbose=optVerbose)
+  elif optNonGuiMode:
+    succeeded = RunNonGuiMode(optTargets, filter=optFilter, verbose=optVerbose)
+  else:
+    if len(optTargets) <=1:
+      ## pre-init 
+      executable = None
+
+      if len(optTargets)==1:
+        executable = optTargets[0]
+
+      gladefile = ResolveGladeFile(sys.argv[0])
+      
+      app=appgui(executable, gladefile, optTest=optTest, optFilter=optFilter)
+      
+      gtk.main()
+      
+      succeeded = app.succeeded
+
+    elif  len(optTargets) > 1:
+      print "Error, too many arguments."
+      PrintUsage(binname)
+      succeeded = False
+
+  ## reachin this line, all windows have been destroyed.
+
+  if succeeded:
+    retcode = 0 # success
+  else:
+    retcode = 1 # failure
+except:
+  retcode = 1 
+
+## Invoking "exit" from within gtk-event-handler, would cause process
+## to return with error code, therefor exit is invoked after GtkMain
+## has been terminated.
+exit(retcode)
+
